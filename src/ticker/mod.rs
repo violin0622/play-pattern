@@ -70,22 +70,15 @@ where
 
     fn run(&mut self, input: Inputs<'a, A>) -> Output<A> {
         self.role.maybe_update_term(&mut self.core, &input);
+        let mut output = Output::default();
         if let Some(msg) = self.role.maybe_deny_req(&self.core, &input) {
-            return Output {
-                req: None,
-                rsp: Some(msg),
-                commit: None,
-            };
+            output.rsp = Some(msg);
+            return output;
         }
         if let Some(output) = self.role.maybe_ignore_rsp(&self.core, &input) {
             return output;
         }
 
-        let mut output = Output {
-            req: None,
-            rsp: None,
-            commit: None,
-        };
         match input {
             Inputs::Tick => {}
             Inputs::Req(msg) => {
@@ -105,7 +98,21 @@ where
                             from: msg.to,
                         })
                     }
-                    Req::RequestVote(req) => todo!(),
+                    Req::RequestVote(req) => {
+                        let rsp = match &mut self.role {
+                            RaftRole::Leader(leader) => {
+                                leader.handle_request_vote_req(&mut self.core, req)
+                            }
+                            RaftRole::Follower(follower) => {
+                                follower.handle_request_vote_req(&mut self.core, req, msg.from)
+                            }
+                        };
+                        Some(Message {
+                            to: msg.from,
+                            from: msg.to,
+                            msg: Rsp::RequestVote(rsp),
+                        })
+                    }
                 };
             }
             Inputs::Rsp(msg) => {
@@ -113,15 +120,25 @@ where
                     (RaftRole::Leader(leader), Rsp::AppendEntries(rsp)) => {
                         leader.handle_append_entries_rsp(&mut self.core, rsp, msg.from)
                     }
-                    (RaftRole::Leader(leader), Rsp::RequestVote(request_vote_rsp)) => todo!(),
-                    (RaftRole::Follower(follower), Rsp::AppendEntries(append_entries_rsp)) => {
-                        todo!()
+                    (RaftRole::Leader(leader), Rsp::RequestVote(request_vote_rsp)) => {
+                        leader.handle_request_vote_rsp()
                     }
-                    (RaftRole::Follower(follower), Rsp::RequestVote(request_vote_rsp)) => todo!(),
+                    (RaftRole::Follower(follower), Rsp::AppendEntries(_append_entries_rsp)) => {
+                        follower.handle_append_entries_rsp()
+                    }
+                    (RaftRole::Follower(follower), Rsp::RequestVote(_request_vote_rsp)) => {
+                        follower.handle_request_vote_rsp()
+                    }
                 };
             }
-            Inputs::Proposql(items) => todo!(),
+            Inputs::Proposql(items) => {
+                let RaftRole::Leader(leader) = &self.role else {
+                    panic!("only leader can handle proposal")
+                };
+                output = leader.proposal(&mut self.core, items);
+            }
         }
+
         output
     }
 }
@@ -168,16 +185,6 @@ where
     Proposql(&'a [u8]),
 }
 
-// struct Inputs<'a, A>
-// where
-//     A: ID,
-// {
-//     tick: u64, //only 1 supported
-//     req: Option<Message<Req<'a>, A>>,
-//     rsp: Option<Message<Rsp, A>>,
-//     proposal: &'a [u8],
-// }
-
 #[derive(Debug, PartialEq, Eq)]
 enum Req<'a> {
     AppendEntries(AppendEntriesReq<'a>),
@@ -221,7 +228,7 @@ struct Want {}
 
 #[cfg(test)]
 mod test {
-    use super::{Core, Input, Raft};
+    use super::{Inputs, Raft};
     use crate::ticker::{AppendEntriesReq, LogEntry, Message, Req};
 
     #[test]
@@ -229,7 +236,7 @@ mod test {
         let mut core = Raft::new(1, 1, vec![2, 3], None, vec![]);
 
         let data = &[0, 1, 2];
-        let output = core.run(Input::Proposql(data));
+        let output = core.run(Inputs::Proposql(data));
 
         let expect = vec![Message {
             to: 2,
@@ -267,8 +274,8 @@ impl ID for u64 {}
 #[derive(Clone)]
 struct Leader<A: ID> {
     // Volatile state on leader
-    next_idx: Option<HashMap<A, u64>>, // init as [1:3] when become leader.
-    match_idx: Option<HashMap<A, u64>>,
+    next_idx: Option<HashMap<A, usize>>, // init as [1:3] when become leader.
+    match_idx: Option<HashMap<A, usize>>,
 }
 
 impl<A: ID> Leader<A> {
@@ -298,58 +305,99 @@ impl<A: ID> Leader<A> {
         from: A,
     ) -> Output<'a, A> {
         if rsp.ok {
-            if let Some(m) = &mut self.next_idx {
-                m.entry(from).and_modify(|v| *v += 1).or_insert(1);
-            }
-            if let Some(m) = &mut self.match_idx {
-                m.insert(from, rsp.match_idx);
+            self.handle_append_entries_rsp_ok(core, rsp, from)
+        } else {
+            self.handle_append_entries_rsp_bad(core, rsp, from)
+        }
+    }
+
+    fn agree<'a>(&self, core: &Core<'a, A>, idx: usize) -> bool {
+        let Some(m) = &self.match_idx else {
+            return false;
+        };
+
+        for peer in &core.peers {
+            if m[&peer] < idx {
+                return false;
             }
         }
 
+        true
+    }
+
+    fn agree_index<'a>(&self, core: &Core<'a, A>) -> usize {
+        let l = core.logs.len();
+        let Some(i) = core.logs.iter().rev().enumerate().find(|(i, log)| {
+            let idx = l - i - 1;
+            self.agree(core, idx)
+        }) else {
+            return 0;
+        };
+        l - i.0 - 1
+    }
+
+    fn handle_append_entries_rsp_ok<'a>(
+        &mut self,
+        core: &mut Core<'a, A>,
+        rsp: AppendEntriesRsp,
+        from: A,
+    ) -> Output<'a, A> {
+        let mut output = Output::<'a, A>::default();
         if let Some(m) = &mut self.next_idx {
-            m.entry(from).and_modify(|v| *v -= 1);
+            m.insert(from, rsp.match_idx as usize + 1);
         }
+        if let Some(m) = &mut self.match_idx {
+            m.insert(from, rsp.match_idx as usize);
+        }
+
+        if self.agree_index(core) > core.commited_idx {
+            let commit = core.logs[core.commited_idx..=self.agree_index(core)].to_vec();
+            output.commit = Some(commit);
+        }
+
+        output
+    }
+
+    fn handle_append_entries_rsp_bad<'a>(
+        &mut self,
+        core: &mut Core<'a, A>,
+        rsp: AppendEntriesRsp,
+        from: A,
+    ) -> Output<'a, A> {
+        if let Some(m) = &mut self.next_idx {
+            m.entry(from).and_modify(|v| *v -= 1).or_insert(1);
+        }
+
+        let prev_idx = self.next_idx.as_ref().map_or(0, |m| m[&from] - 1);
+        let last_entry_idx = min(core.logs.len(), prev_idx as usize + 1);
+
+        let msg = Message {
+            from: core.id,
+            to: from,
+            msg: Req::AppendEntries(AppendEntriesReq {
+                term: core.term,
+                prev_log_index: prev_idx as u64,
+                prev_log_term: core.logs[prev_idx as usize].term,
+                leader_commit: core.commited_idx as u64,
+                entries: core.logs[prev_idx as usize..last_entry_idx].to_vec(),
+            }),
+        };
         Output {
-            req: Some(),
+            req: Some(vec![msg]),
             rsp: None,
             commit: None,
         }
     }
 
-    fn handle_append_entries_ok<'a>(
-        &self,
-        core: &mut Core<'a, A>,
-        rsp: AppendEntriesRsp,
-    ) -> Option<Vec<LogEntry<'_>>> {
-        None
+    fn handle_request_vote_req<'a>(&mut self, core: &mut Core<'a, A>, req: RequestVoteReq) -> ! {
+        unreachable!("leader should not process request vote");
     }
 
-    fn handle_request_vote_req<'a>(
-        &mut self,
-        core: &mut Core<'a, A>,
-        input: Input,
-    ) -> RoleOutput<'a, A> {
-        RoleOutput {
-            role: RaftRole::Follower(Follower::new()),
-            msg: Output {
-                req: None,
-                rsp: None,
-                commit: None,
-            },
-        }
-    }
-    fn handle_request_vote_rsp<'a>(
-        &mut self,
-        core: &mut Core<'a, A>,
-        input: Input,
-    ) -> RoleOutput<'a, A> {
-        RoleOutput {
-            role: RaftRole::Follower(Follower::new()),
-            msg: Output {
-                req: None,
-                rsp: None,
-                commit: None,
-            },
+    fn handle_request_vote_rsp<'a>(&mut self) -> Output<'a, A> {
+        Output {
+            req: None,
+            rsp: None,
+            commit: None,
         }
     }
 
@@ -372,7 +420,7 @@ impl<A: ID> Leader<A> {
                     to: *peer,
                     msg: Req::AppendEntries(AppendEntriesReq {
                         term: core.term,
-                        prev_log_index: prev_idx,
+                        prev_log_index: prev_idx as u64,
                         prev_log_term: core.logs[prev_idx as usize].term,
                         leader_commit: core.commited_idx as u64,
                         entries: core.logs[prev_idx as usize..last_entry_idx].to_vec(),
@@ -404,7 +452,11 @@ impl Follower {
 }
 
 impl Follower {
-    fn handle<'a, A: ID>(&mut self, core: &mut Core<'a, A>, _in: Input) -> RoleOutput<'a, A> {
+    fn handle<'a, A: ID>(
+        &mut self,
+        core: &mut Core<'a, A>,
+        _in: Inputs<'a, A>,
+    ) -> RoleOutput<'a, A> {
         if true {
             RoleOutput {
                 role: RaftRole::Follower(Follower::new()),
@@ -473,6 +525,42 @@ impl Follower {
             }
         }
     }
+
+    fn handle_append_entries_rsp<'a, A: ID>(&self) -> Output<'a, A> {
+        Output {
+            req: None,
+            rsp: None,
+            commit: None,
+        }
+    }
+
+    fn handle_request_vote_rsp<'a, A: ID>(&self) -> Output<'a, A> {
+        Output {
+            req: None,
+            rsp: None,
+            commit: None,
+        }
+    }
+
+    fn handle_request_vote_req<'a, A: ID>(
+        &mut self,
+        core: &mut Core<'a, A>,
+        req: RequestVoteReq,
+        from: A,
+    ) -> RequestVoteRsp {
+        let last_term = core.logs.last().map_or(0, |e| e.term);
+        let log_ok = req.last_log_term > last_term
+            || (req.last_log_term == last_term && req.last_log_index as usize >= core.logs.len());
+        let grant = log_ok && core.voted_for.is_none_or(|x| x == from);
+
+        if grant {
+            core.voted_for = Some(from);
+        }
+        RequestVoteRsp {
+            term: core.term,
+            granted: grant,
+        }
+    }
 }
 
 struct RoleOutput<'a, A>
@@ -489,15 +577,18 @@ impl<A: ID> RaftRole<A> {
     }
 
     fn maybe_update_term<'a>(&mut self, core: &mut Core<'a, A>, input: &Inputs<'a, A>) {
-        if let Inputs::Req(msg) = input {
-            if let Req::AppendEntries(req) = &msg.msg {
-                if req.term > core.term {
-                    core.term = req.term;
-                    core.voted_for = None;
-                    *self = RaftRole::Follower(Follower::new());
-                }
-            }
+        let Inputs::Req(Message { msg, .. }) = input else {
+            return;
+        };
+        let Req::AppendEntries(req) = &msg else {
+            return;
+        };
+        if req.term <= core.term {
+            return;
         }
+        core.term = req.term;
+        core.voted_for = None;
+        *self = RaftRole::Follower(Follower::new());
     }
 
     fn maybe_ignore_rsp<'a>(
