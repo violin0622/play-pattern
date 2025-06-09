@@ -11,14 +11,15 @@ struct Core<'a, A>
 where
     A: ID,
 {
-    term: u64,
-    tick: u64,
     id: A,
+    term: u64,
     peers: HashSet<A>,
     voted_for: Option<A>,
     logs: Vec<LogEntry<'a>>,
+    cfg: RaftConfig,
 
     // Volatile state
+    tick: u64,
     commited_idx: usize,
     last_append_idx: usize,
 }
@@ -29,6 +30,7 @@ where
 {
     pub fn new(
         term: u64,
+        cfg: RaftConfig,
         id: A,
         peers: Vec<A>,
         voted_for: Option<A>,
@@ -37,6 +39,7 @@ where
         Self {
             term,
             id,
+            cfg,
             logs,
             voted_for,
             tick: 0,
@@ -47,6 +50,27 @@ where
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct RaftConfig {
+    election_timeout: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PersistStates<A>
+where
+    A: ID,
+{
+    id: A,
+    term: u64,
+    peers: HashSet<A>,
+    voted_for: Option<A>,
+}
+
+struct VolatileStates {
+    commited_idx: usize,
+    last_append_idx: usize,
+}
+
 struct Raft<'a, A>
 where
     A: ID,
@@ -55,15 +79,43 @@ where
     role: RaftRole<A>,
 }
 
+struct RaftV2<'a, A>
+where
+    A: ID,
+{
+    vs: VolatileStates,
+    ps: PersistStates<A>,
+    logs: Vec<LogEntry<'a>>,
+}
+
+struct OutputV2<'a, A>
+where
+    A: ID,
+{
+    req: Option<Vec<Message<Req<'a>, A>>>,
+    rsp: Option<Message<Rsp, A>>,
+    commit: Option<Vec<LogEntry<'a>>>,
+    vs: Option<VolatileStates>,
+}
+
+type OutputResult<'a, A> = std::result::Result<OutputV2<'a, A>, Box<dyn std::error::Error>>;
+
 trait ID: Default + PartialEq + Eq + Hash + Copy + std::fmt::Debug + std::fmt::Display {}
 
 impl<'a, A> Raft<'a, A>
 where
     A: ID,
 {
-    fn new(term: u64, id: A, peers: Vec<A>, voted_for: Option<A>, logs: Vec<LogEntry<'a>>) -> Self {
+    fn new(
+        term: u64,
+        cfg: RaftConfig,
+        id: A,
+        peers: Vec<A>,
+        voted_for: Option<A>,
+        logs: Vec<LogEntry<'a>>,
+    ) -> Self {
         Self {
-            core: Core::new(term, id, peers, voted_for, logs),
+            core: Core::new(term, cfg, id, peers, voted_for, logs),
             role: RaftRole::new(),
         }
     }
@@ -120,13 +172,13 @@ where
                     (RaftRole::Leader(leader), Rsp::AppendEntries(rsp)) => {
                         leader.handle_append_entries_rsp(&mut self.core, rsp, msg.from)
                     }
-                    (RaftRole::Leader(leader), Rsp::RequestVote(request_vote_rsp)) => {
+                    (RaftRole::Leader(leader), Rsp::RequestVote(_)) => {
                         leader.handle_request_vote_rsp()
                     }
-                    (RaftRole::Follower(follower), Rsp::AppendEntries(_append_entries_rsp)) => {
+                    (RaftRole::Follower(follower), Rsp::AppendEntries(_)) => {
                         follower.handle_append_entries_rsp()
                     }
-                    (RaftRole::Follower(follower), Rsp::RequestVote(_request_vote_rsp)) => {
+                    (RaftRole::Follower(follower), Rsp::RequestVote(_)) => {
                         follower.handle_request_vote_rsp()
                     }
                 };
@@ -140,6 +192,21 @@ where
         }
 
         output
+    }
+
+    fn run_v2(&mut self, input: Inputs<'a, A>) -> Output<'a, A> {
+        match (input, &mut self.role) {
+            (Inputs::Req(message), RaftRole::Leader(leader)) => todo!(),
+            (Inputs::Req(message), RaftRole::Follower(follower)) => todo!(),
+            (Inputs::Rsp(message), RaftRole::Leader(leader)) => todo!(),
+            (Inputs::Rsp(message), RaftRole::Follower(follower)) => todo!(),
+            (Inputs::Tick, RaftRole::Leader(leader)) => todo!(),
+            (Inputs::Tick, RaftRole::Follower(follower)) => todo!(),
+            (Inputs::Proposql(items), RaftRole::Leader(leader)) => {
+                leader.proposal(&mut self.core, items)
+            }
+            (Inputs::Proposql(items), RaftRole::Follower(follower)) => todo!(),
+        }
     }
 }
 
@@ -229,14 +296,17 @@ struct Want {}
 #[cfg(test)]
 mod test {
     use super::{Inputs, Raft};
-    use crate::ticker::{AppendEntriesReq, LogEntry, Message, Req};
+    use crate::ticker::{AppendEntriesReq, LogEntry, Message, RaftConfig, Req};
 
     #[test]
     fn proposal() {
-        let mut core = Raft::new(1, 1, vec![2, 3], None, vec![]);
+        let cfg = RaftConfig {
+            election_timeout: 10,
+        };
+        let mut raft = Raft::new(1, cfg, 1, vec![2, 3], None, vec![]);
 
         let data = &[0, 1, 2];
-        let output = core.run(Inputs::Proposql(data));
+        let output = raft.run(Inputs::Proposql(data));
 
         let expect = vec![Message {
             to: 2,
@@ -267,6 +337,14 @@ mod test {
             expect.len(),
         );
     }
+
+    fn vector() {
+        let mut v = vec![];
+        let a = std::time::Instant::now();
+        v.push(&a);
+
+        println!("{:?}", v[0]);
+    }
 }
 
 impl ID for u64 {}
@@ -290,11 +368,7 @@ impl<A: ID> Leader<A> {
 }
 
 impl<A: ID> Leader<A> {
-    fn handle_append_entries_req<'a>(
-        &mut self,
-        core: &mut Core<'a, A>,
-        req: AppendEntriesReq,
-    ) -> ! {
+    fn handle_append_entries_req(&mut self, core: &mut Core<'_, A>, req: AppendEntriesReq) -> ! {
         unreachable!("leader shouldn't handle append entries request!");
     }
 
@@ -311,13 +385,13 @@ impl<A: ID> Leader<A> {
         }
     }
 
-    fn agree<'a>(&self, core: &Core<'a, A>, idx: usize) -> bool {
+    fn agree(&self, core: &Core<'_, A>, idx: usize) -> bool {
         let Some(m) = &self.match_idx else {
             return false;
         };
 
         for peer in &core.peers {
-            if m[&peer] < idx {
+            if m[peer] < idx {
                 return false;
             }
         }
@@ -325,7 +399,7 @@ impl<A: ID> Leader<A> {
         true
     }
 
-    fn agree_index<'a>(&self, core: &Core<'a, A>) -> usize {
+    fn agree_index(&self, core: &Core<'_, A>) -> usize {
         let l = core.logs.len();
         let Some(i) = core.logs.iter().rev().enumerate().find(|(i, log)| {
             let idx = l - i - 1;
@@ -369,7 +443,7 @@ impl<A: ID> Leader<A> {
         }
 
         let prev_idx = self.next_idx.as_ref().map_or(0, |m| m[&from] - 1);
-        let last_entry_idx = min(core.logs.len(), prev_idx as usize + 1);
+        let last_entry_idx = min(core.logs.len(), prev_idx + 1);
 
         let msg = Message {
             from: core.id,
@@ -377,9 +451,9 @@ impl<A: ID> Leader<A> {
             msg: Req::AppendEntries(AppendEntriesReq {
                 term: core.term,
                 prev_log_index: prev_idx as u64,
-                prev_log_term: core.logs[prev_idx as usize].term,
+                prev_log_term: core.logs[prev_idx].term,
                 leader_commit: core.commited_idx as u64,
-                entries: core.logs[prev_idx as usize..last_entry_idx].to_vec(),
+                entries: core.logs[prev_idx..last_entry_idx].to_vec(),
             }),
         };
         Output {
@@ -389,7 +463,7 @@ impl<A: ID> Leader<A> {
         }
     }
 
-    fn handle_request_vote_req<'a>(&mut self, core: &mut Core<'a, A>, req: RequestVoteReq) -> ! {
+    fn handle_request_vote_req(&mut self, core: &mut Core<'_, A>, req: RequestVoteReq) -> ! {
         unreachable!("leader should not process request vote");
     }
 
@@ -413,7 +487,7 @@ impl<A: ID> Leader<A> {
             .iter()
             .map(|peer| {
                 let prev_idx = self.next_idx.as_ref().map_or(0, |m| m[peer] - 1);
-                let last_entry_idx = min(core.logs.len(), prev_idx as usize + 1);
+                let last_entry_idx = min(core.logs.len(), prev_idx + 1);
 
                 Message {
                     from: core.id,
@@ -421,9 +495,9 @@ impl<A: ID> Leader<A> {
                     msg: Req::AppendEntries(AppendEntriesReq {
                         term: core.term,
                         prev_log_index: prev_idx as u64,
-                        prev_log_term: core.logs[prev_idx as usize].term,
+                        prev_log_term: core.logs[prev_idx].term,
                         leader_commit: core.commited_idx as u64,
-                        entries: core.logs[prev_idx as usize..last_entry_idx].to_vec(),
+                        entries: core.logs[prev_idx..last_entry_idx].to_vec(),
                     }),
                 }
             })
@@ -444,41 +518,20 @@ where
     Follower(Follower),
 }
 
-struct Follower {}
+struct Follower {
+    last_append_entries_req: u64,
+}
+
 impl Follower {
     fn new() -> Self {
-        Self {}
+        Self {
+            last_append_entries_req: 0,
+        }
     }
 }
 
 impl Follower {
-    fn handle<'a, A: ID>(
-        &mut self,
-        core: &mut Core<'a, A>,
-        _in: Inputs<'a, A>,
-    ) -> RoleOutput<'a, A> {
-        if true {
-            RoleOutput {
-                role: RaftRole::Follower(Follower::new()),
-                msg: Output {
-                    req: None,
-                    rsp: None,
-                    commit: None,
-                },
-            }
-        } else {
-            RoleOutput {
-                role: RaftRole::Leader(Leader::new(&core.peers)),
-                msg: Output {
-                    req: None,
-                    rsp: None,
-                    commit: None,
-                },
-            }
-        }
-    }
-
-    fn append_entries_ok<'a>(&self, req: AppendEntriesReq<'a>) -> AppendEntriesRsp {
+    fn append_entries_ok(&self, req: AppendEntriesReq<'_>) -> AppendEntriesRsp {
         AppendEntriesRsp {
             ok: true,
             term: req.term,
@@ -486,7 +539,7 @@ impl Follower {
         }
     }
 
-    fn append_entries_bad<'a, A: ID>(&self, core: &Core<'a, A>) -> AppendEntriesRsp {
+    fn append_entries_bad<A: ID>(&self, core: &Core<'_, A>) -> AppendEntriesRsp {
         AppendEntriesRsp {
             match_idx: 0,
             ok: false,
@@ -503,13 +556,13 @@ impl Follower {
             return self.append_entries_bad(core);
         }
         match (req.prev_log_index as usize, core.logs.len()) {
-            (0, 0) => return self.append_entries_ok(req),
+            (0, 0) => self.append_entries_ok(req),
             (0, llen) if llen > 0 => {
                 core.logs.clear();
                 core.logs.append(&mut req.entries.clone());
-                return self.append_entries_ok(req);
+                self.append_entries_ok(req)
             }
-            (pidx, 0) if pidx > 0 => return self.append_entries_bad(core),
+            (pidx, 0) if pidx > 0 => self.append_entries_bad(core),
             (pidx, llen) => {
                 if llen <= pidx {
                     return self.append_entries_bad(core);
@@ -521,7 +574,7 @@ impl Follower {
                     core.logs.truncate(pidx + 1);
                 }
                 core.logs.append(&mut req.entries.clone());
-                return self.append_entries_ok(req);
+                self.append_entries_ok(req)
             }
         }
     }
@@ -542,15 +595,15 @@ impl Follower {
         }
     }
 
-    fn handle_request_vote_req<'a, A: ID>(
+    fn handle_request_vote_req<A: ID>(
         &mut self,
-        core: &mut Core<'a, A>,
+        core: &mut Core<'_, A>,
         req: RequestVoteReq,
         from: A,
     ) -> RequestVoteRsp {
         let last_term = core.logs.last().map_or(0, |e| e.term);
         let log_ok = req.last_log_term > last_term
-            || (req.last_log_term == last_term && req.last_log_index as usize >= core.logs.len());
+            || (req.last_log_term == last_term && req.last_log_index >= core.logs.len());
         let grant = log_ok && core.voted_for.is_none_or(|x| x == from);
 
         if grant {
